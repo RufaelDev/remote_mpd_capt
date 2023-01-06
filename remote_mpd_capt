@@ -1,0 +1,211 @@
+import urllib3
+import certifi
+import lxml
+from lxml import etree
+from io import BytesIO
+import sys
+
+"""
+Copyright codeshop B.V 2023
+
+Script for capturing mpd contents from a remote mpd 
+python remote_mpd_capt  http://my_mpd_uri/my_mpd.mpd
+captures segments as cmaf tracks i.e. separate mp4 tracks 
+SegmentTemplate + segmentTimeline 
+SegmentTemplate (only capture 6 segments)
+SegmentBase (capture BaseURLs only)
+depends only on lxml
+"""
+
+## expand a segment timline to a segment list
+def expand_segment_timeline(seg_timeline):
+
+    seg_list = []
+    r, d, t = (0, 0, 0)
+
+    for SS in seg_timeline:
+        if 't' in SS.attrib:
+            t = int(SS.get('t'))
+
+        if 'r' in SS.attrib:
+            r = int(SS.get('r'))
+
+        if 'd' in SS.attrib:
+            d = int(SS.get('d'))
+
+        for r in range(0,r+1):
+            seg_list.append((t + r*d,d))
+        t = t + d * (r+1)
+        r = 0
+
+    return seg_list
+
+
+## parser and html
+http = urllib3.PoolManager(ca_certs=certifi.where())
+parser = etree.XMLParser(remove_comments=True)
+
+## todo make hte url configureable 
+mpd_uri = sys.argv[1]
+mpd = http.request('GET',mpd_uri )
+tree = etree.parse(BytesIO(mpd.data),parser)
+root = tree.getroot()
+
+
+template_element = {}
+pos_t = mpd_uri.rfind('/') 
+rooturl = mpd_uri[0:pos_t + 1]
+
+print("capturing mpd uri: ", mpd_uri)
+print("root uri: ", rooturl )
+baseurl = ''
+for p in root:
+
+        if etree.QName(p.tag).localname == \
+            "Period":
+            
+            for a in p:
+                if etree.QName(a.tag).localname == \
+                       "BaseURL":
+                            baseurl = r.text
+                            
+                if etree.QName(a.tag).localname == \
+                "AdaptationSet":
+                    
+                    for r in a:
+                        if etree.QName(r.tag).localname == \
+                        "BaseURL":
+                            baseurl = r.text
+                        if etree.QName(r.tag).localname == \
+                        "Representation":
+                            
+                            bw = 0 
+                            rep_id =''
+                            init=''
+                            segments = []
+                            ss = []
+                            
+                            
+
+                            if 'bandwidth' in r.attrib:
+                                bw = str(r.get('bandwidth'))
+                            if 'id' in r.attrib: 
+                                rep_id = str(r.get('id'))
+                                rep_id.replace('$Bandwidth$',bw)
+                            
+                            seg_t = template_element
+                            has_seg_base = False
+                            base_url = ''
+
+                            for seg_in_r in r:
+                                
+                                if etree.QName(seg_in_r.tag).localname == \
+                                "SegmentTemplate":
+                                    seg_t = seg_in_r
+
+                                if etree.QName(seg_in_r.tag).localname == \
+                                "BaseURL":
+                                    base_url = str(seg_in_r.text)
+                                
+                                if etree.QName(seg_in_r.tag).localname == \
+                                "SegmentBase":
+                                    print("found segment base of representation: ", rep_id, "with bandwidth: ", bw)
+                                    f =  open(rep_id + '.mp4', 'wb')
+                                    seg_base_uri = base_url 
+                                    if base_url[0:4] != 'http':
+                                        seg_base_uri  = rooturl  + base_url  
+                                    
+                                    print(seg_base_uri)
+                                    req1 = http.request('GET',  seg_base_uri)
+                                    f.write(req1.data)
+                                    f.close()
+                                    has_seg_base = True
+                                    continue
+                                    
+                            if has_seg_base:
+                                continue
+
+                            if 'initialization' in seg_t.attrib:
+                                
+                                init = str(seg_t.get('initialization'))
+                                init = init.replace('$RepresentationID$',rep_id)
+                                
+                                if baseurl[0:4] != 'http':
+                                    init = rooturl  + baseurl + init 
+                                else:
+                                    init = baseurl + init 
+                                
+                            if 'startNumber' in seg_t.attrib:
+                                start_number = int(seg_t.attrib['startNumber'])
+
+                            if 'duration' in seg_t.attrib:
+                            
+                                duration = int(seg_t.attrib['duration'])
+                                
+                                if 'media' in seg_t.attrib:
+                                    
+                                    for i in range(start_number,6):
+                                            
+                                            media = str(seg_t.get('media')) 
+                                            media = media.replace('$RepresentationID$',rep_id)
+                                            media = media.replace('$Time$',str(i*duration))
+                                            media = media.replace('$Number$',str(i))
+                                            
+                                            if baseurl[0:4] != 'http':
+                                                segments.append(rooturl + '/' + baseurl + media) 
+                                            else:
+                                                segments.append(baseurl + media) 
+                                    
+                            else:
+                                for t in seg_t:
+                                    
+                                    if etree.QName(t.tag).localname == \
+                                    "SegmentTimeline":
+                                        
+                                        ss = expand_segment_timeline(t)
+                                        start_number = 1
+                                        
+                                        if 'startNumber' in seg_t.attrib:
+                                            start_number = int(seg_t.attrib['startNumber'])
+                                        
+                                        i = start_number
+                                        
+                                        for t in ss:
+                                            
+                                            media = str(seg_t.get('media')) 
+                                            media = media.replace('$RepresentationID$',rep_id)
+                                            media = media.replace('$Time$',str(t[0]))
+                                            media = media.replace('$Number$',str(i))
+                                            
+                                            i+=1
+                                            if baseurl[0:4] != 'http':
+                                                segments.append(rooturl  + baseurl + media) 
+                                            else:
+                                                segments.append(baseurl + '/'+ media) 
+
+                            print("found representation, bandwidth =", bw, 'representation id = ', rep_id, 'init segment =', init)
+
+                            try:
+                                req1 = http.request('GET', init)
+                                f =  open(rep_id + '.mp4', 'wb')
+                                f.write(req1.data)
+                                
+                                for a in segments:
+                                    try:
+                                        print("downloading: ", a)
+                                        req2 = http.request('GET', a)
+                                        f.write(req2.data)
+                                    except: 
+                                        print("error occured for segment: ", a)
+                                        exit(0)
+                                
+                                print("done downloading representation: ", rep_id, "stored in ", rep_id + '.mp4')
+                                f.close()
+                            except:
+                                print("something went wrong downloading and writing the representation")
+                                exit(0)
+                                
+
+                        if etree.QName(r.tag).localname == \
+                        "SegmentTemplate":
+                            template_element = r
